@@ -164,3 +164,11 @@ cython_debug/
 .DS_STORE
 *.pt
 .aider*
+*.ply
+*.PLY
+*.png
+
+Input/VideoSplatTest5s_Frames000.png
+output/VideoSplatTest5s_Frames000.ply
+Input/VideoSplatTest5s_Frames000.png
+output/VideoSplatTest5s_Frames000.ply
