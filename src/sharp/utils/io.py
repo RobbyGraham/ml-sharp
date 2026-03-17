@@ -27,7 +27,10 @@ Image.MAX_IMAGE_PIXELS = 200000000
 
 
 def load_rgb(
-    path: Path, auto_rotate: bool = True, remove_alpha: bool = True
+    path: Path,
+    auto_rotate: bool = True,
+    remove_alpha: bool = True,
+    focal_length_35mm_mm: float | None = None,
 ) -> tuple[np.ndarray, list[bytes] | None, float]:
     """Load an RGB image."""
     LOGGER.debug(f"Loading image {path} ...")
@@ -53,18 +56,6 @@ def load_rgb(
         elif exif_orientation != 1:
             LOGGER.warning(f"Ignoring image orientation {exif_orientation}.")
 
-    # Extract the focal length.
-    f_35mm = img_exif.get("FocalLengthIn35mmFilm", img_exif.get("FocalLenIn35mmFilm", None))
-    if f_35mm is None or f_35mm < 1:
-        f_35mm = img_exif.get("FocalLength", None)
-        if f_35mm is None:
-            LOGGER.warn(f"Did not find focallength in exif data of {path} - Setting to 30mm.")
-            f_35mm = 30.0
-        if f_35mm < 10.0:
-            LOGGER.info("Found focal length below 10mm, assuming it's not for 35mm.")
-            # This is a very crude approximation.
-            f_35mm *= 8.4
-
     img = np.asarray(img_pil)
     # Convert to RGB if single channel.
     if img.ndim < 3 or img.shape[2] == 1:
@@ -72,6 +63,21 @@ def load_rgb(
 
     if remove_alpha:
         img = img[:, :, :3]
+
+    # Extract the focal length.
+    if focal_length_35mm_mm is not None:
+        f_35mm = focal_length_35mm_mm
+    else:
+        f_35mm = img_exif.get("FocalLengthIn35mmFilm", img_exif.get("FocalLenIn35mmFilm", None))
+        if f_35mm is None or f_35mm < 1:
+            f_35mm = img_exif.get("FocalLength", None)
+            if f_35mm is None:
+                LOGGER.warning(f"Did not find focallength in exif data of {path} - Setting to 30mm.")
+                f_35mm = 30.0
+            if f_35mm < 10.0:
+                LOGGER.info("Found focal length below 10mm, assuming it's not for 35mm.")
+                # This is a very crude approximation.
+                f_35mm *= 8.4
 
     LOGGER.debug(f"\tHxW: {img.shape[0]}x{img.shape[1]}")
     LOGGER.debug(f"\tfocal length @ 35mm film: {f_35mm}mm")

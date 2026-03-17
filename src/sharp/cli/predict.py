@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import NamedTuple
 
 import click
 import numpy as np
@@ -24,9 +25,13 @@ from sharp.utils import io
 from sharp.utils import logging as logging_utils
 from sharp.utils.gaussians import (
     Gaussians3D,
+    PreparedGaussians3D,
     SceneMetaData,
+    finalize_prepared_gaussians,
+    get_unprojection_matrix,
+    move_prepared_gaussians_to_cpu,
+    prepare_gaussians_for_decomposition,
     save_ply,
-    unproject_gaussians,
 )
 
 from .render import render_gaussians
@@ -34,6 +39,18 @@ from .render import render_gaussians
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
+INTERNAL_SHAPE = (1536, 1536)
+
+
+class PreparedPredictionInputs(NamedTuple):
+    """Preprocessed tensors and metadata for one SHARP prediction."""
+
+    image_resized_pt: torch.Tensor
+    disparity_factor: torch.Tensor
+    intrinsics_resized: torch.Tensor
+    image_shape: tuple[int, int]
+    internal_shape: tuple[int, int]
+    focal_length_px: float
 
 
 @click.command()
@@ -163,44 +180,91 @@ def predict_image(
     device: torch.device,
 ) -> Gaussians3D:
     """Predict Gaussians from an image."""
-    internal_shape = (1536, 1536)
-
     LOGGER.info("Running preprocessing.")
+    prepared_inputs = prepare_image_for_prediction(image, f_px, device)
+
+    # Predict Gaussians in the NDC space.
+    LOGGER.info("Running inference.")
+    gaussians_ndc = predict_image_ndc(predictor, prepared_inputs)
+
+    LOGGER.info("Running postprocessing.")
+    prepared_gaussians = prepare_prediction_postprocess_inputs(gaussians_ndc, prepared_inputs)
+    return finalize_prepared_gaussians(
+        prepared_gaussians,
+        output_device=device,
+        output_dtype=torch.float32,
+    )
+
+
+def prepare_image_for_prediction(
+    image: np.ndarray,
+    f_px: float,
+    device: torch.device,
+    internal_shape: tuple[int, int] = INTERNAL_SHAPE,
+) -> PreparedPredictionInputs:
+    """Preprocess one image for SHARP prediction."""
     image_pt = torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
     _, height, width = image_pt.shape
-    disparity_factor = torch.tensor([f_px / width]).float().to(device)
-
+    disparity_factor = torch.tensor([f_px / width], device=device, dtype=torch.float32)
     image_resized_pt = F.interpolate(
         image_pt[None],
         size=(internal_shape[1], internal_shape[0]),
         mode="bilinear",
         align_corners=True,
     )
-
-    # Predict Gaussians in the NDC space.
-    LOGGER.info("Running inference.")
-    gaussians_ndc = predictor(image_resized_pt, disparity_factor)
-
-    LOGGER.info("Running postprocessing.")
-    intrinsics = (
-        torch.tensor(
-            [
-                [f_px, 0, width / 2, 0],
-                [0, f_px, height / 2, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ]
-        )
-        .float()
-        .to(device)
+    intrinsics = torch.tensor(
+        [
+            [f_px, 0, width / 2, 0],
+            [0, f_px, height / 2, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ],
+        device=device,
+        dtype=torch.float32,
     )
     intrinsics_resized = intrinsics.clone()
     intrinsics_resized[0] *= internal_shape[0] / width
     intrinsics_resized[1] *= internal_shape[1] / height
-
-    # Convert Gaussians to metrics space.
-    gaussians = unproject_gaussians(
-        gaussians_ndc, torch.eye(4).to(device), intrinsics_resized, internal_shape
+    return PreparedPredictionInputs(
+        image_resized_pt=image_resized_pt,
+        disparity_factor=disparity_factor,
+        intrinsics_resized=intrinsics_resized,
+        image_shape=(height, width),
+        internal_shape=internal_shape,
+        focal_length_px=f_px,
     )
 
-    return gaussians
+
+def predict_image_ndc(
+    predictor: RGBGaussianPredictor,
+    prepared_inputs: PreparedPredictionInputs,
+) -> Gaussians3D:
+    """Run the model forward pass and return NDC Gaussians."""
+    return predictor(
+        prepared_inputs.image_resized_pt,
+        prepared_inputs.disparity_factor,
+    )
+
+
+def prepare_prediction_postprocess_inputs(
+    gaussians_ndc: Gaussians3D,
+    prepared_inputs: PreparedPredictionInputs,
+) -> PreparedGaussians3D:
+    """Prepare exact postprocess inputs on the current device."""
+    device = prepared_inputs.image_resized_pt.device
+    extrinsics = torch.eye(4, device=device, dtype=prepared_inputs.intrinsics_resized.dtype)
+    unprojection_matrix = get_unprojection_matrix(
+        extrinsics,
+        prepared_inputs.intrinsics_resized,
+        prepared_inputs.internal_shape,
+    )
+    return prepare_gaussians_for_decomposition(gaussians_ndc, unprojection_matrix[:3])
+
+
+def prepare_prediction_postprocess_inputs_cpu(
+    gaussians_ndc: Gaussians3D,
+    prepared_inputs: PreparedPredictionInputs,
+) -> PreparedGaussians3D:
+    """Prepare exact postprocess inputs on CPU for concurrent finalization."""
+    prepared_gaussians = prepare_prediction_postprocess_inputs(gaussians_ndc, prepared_inputs)
+    return move_prepared_gaussians_to_cpu(prepared_gaussians)

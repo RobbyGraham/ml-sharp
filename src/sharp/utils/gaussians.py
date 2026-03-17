@@ -7,6 +7,7 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
@@ -41,6 +42,49 @@ class Gaussians3D(NamedTuple):
             colors=self.colors.to(device),
             opacities=self.opacities.to(device),
         )
+
+
+class PreparedGaussians3D(NamedTuple):
+    """Intermediate representation used before covariance decomposition."""
+
+    mean_vectors: torch.Tensor
+    covariance_matrices: torch.Tensor
+    colors: torch.Tensor
+    opacities: torch.Tensor
+
+
+class CovarianceDecompositionResult(NamedTuple):
+    """Exact covariance decomposition result with timing breakdown."""
+
+    quaternions: torch.Tensor
+    singular_values: torch.Tensor
+    svd_seconds: float
+    reflection_seconds: float
+    quaternion_conversion_seconds: float
+    singular_value_seconds: float
+
+
+class FinalizedGaussiansResult(NamedTuple):
+    """Finalized Gaussians with exact CPU timing breakdown."""
+
+    gaussians: Gaussians3D
+    cpu_svd_seconds: float
+    cpu_finalize_seconds: float
+    cpu_reflection_seconds: float
+    cpu_quaternion_conversion_seconds: float
+    cpu_singular_value_seconds: float
+    cpu_assembly_seconds: float
+
+
+class PlySaveResult(NamedTuple):
+    """PLY export result with timing breakdown."""
+
+    plydata: PlyData
+    ply_tensor_export_seconds: float
+    ply_vertex_fill_seconds: float
+    ply_metadata_pack_seconds: float
+    ply_pack_seconds: float
+    ply_write_seconds: float
 
 
 class SceneMetaData(NamedTuple):
@@ -110,29 +154,18 @@ def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussian
 
     Note: This operation is not differentiable.
     """
-    transform_linear = transform[..., :3, :3]
-    transform_offset = transform[..., :3, 3]
-
-    mean_vectors = gaussians.mean_vectors @ transform_linear.T + transform_offset
-    covariance_matrices = compose_covariance_matrices(
-        gaussians.quaternions, gaussians.singular_values
-    )
-    covariance_matrices = (
-        transform_linear @ covariance_matrices @ transform_linear.transpose(-1, -2)
-    )
-    quaternions, singular_values = decompose_covariance_matrices(covariance_matrices)
-
-    return Gaussians3D(
-        mean_vectors=mean_vectors,
-        singular_values=singular_values,
-        quaternions=quaternions,
-        colors=gaussians.colors,
-        opacities=gaussians.opacities,
+    prepared_gaussians = prepare_gaussians_for_decomposition(gaussians, transform)
+    return finalize_prepared_gaussians(
+        prepared_gaussians,
+        output_device=gaussians.mean_vectors.device,
+        output_dtype=gaussians.mean_vectors.dtype,
     )
 
 
 def decompose_covariance_matrices(
     covariance_matrices: torch.Tensor,
+    output_dtype: torch.dtype | None = None,
+    output_device: torch.device | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decompose 3D covariance matrices into quaternions and singular values.
 
@@ -145,15 +178,34 @@ def decompose_covariance_matrices(
 
     Note: This operation is not differentiable.
     """
+    result = decompose_covariance_matrices_profiled(
+        covariance_matrices,
+        output_dtype=output_dtype,
+        output_device=output_device,
+    )
+    return result.quaternions, result.singular_values
+
+
+def decompose_covariance_matrices_profiled(
+    covariance_matrices: torch.Tensor,
+    output_dtype: torch.dtype | None = None,
+    output_device: torch.device | None = None,
+) -> CovarianceDecompositionResult:
+    """Decompose covariance matrices and capture exact CPU timing."""
     device = covariance_matrices.device
     dtype = covariance_matrices.dtype
+    if output_dtype is None:
+        output_dtype = dtype
+    if output_device is None:
+        output_device = device
 
-    # We convert to fp64 to avoid numerical errors.
-    covariance_matrices = covariance_matrices.detach().cpu().to(torch.float64)
+    covariance_matrices = covariance_matrices.detach().to(device="cpu", dtype=torch.float64)
+
+    svd_start = time.perf_counter()
     rotations, singular_values_2, _ = torch.linalg.svd(covariance_matrices)
+    svd_seconds = time.perf_counter() - svd_start
 
-    # NOTE: in SVD, it is possible that U and VT are both reflections.
-    # We need to correct them.
+    reflection_start = time.perf_counter()
     batch_idx, gaussian_idx = torch.where(torch.linalg.det(rotations) < 0)
     num_reflections = len(gaussian_idx)
     if num_reflections > 0:
@@ -161,12 +213,143 @@ def decompose_covariance_matrices(
             "Received %d reflection matrices from SVD. Flipping them to rotations.",
             num_reflections,
         )
-        # Flip the last column of reflection and make it a rotation.
         rotations[batch_idx, gaussian_idx, :, -1] *= -1
+    reflection_seconds = time.perf_counter() - reflection_start
+
+    quaternion_start = time.perf_counter()
     quaternions = linalg.quaternions_from_rotation_matrices(rotations)
-    quaternions = quaternions.to(dtype=dtype, device=device)
-    singular_values = singular_values_2.sqrt().to(dtype=dtype, device=device)
-    return quaternions, singular_values
+    quaternions = quaternions.to(dtype=output_dtype, device=output_device)
+    quaternion_conversion_seconds = time.perf_counter() - quaternion_start
+
+    singular_value_start = time.perf_counter()
+    singular_values = singular_values_2.sqrt().to(dtype=output_dtype, device=output_device)
+    singular_value_seconds = time.perf_counter() - singular_value_start
+
+    return CovarianceDecompositionResult(
+        quaternions=quaternions,
+        singular_values=singular_values,
+        svd_seconds=svd_seconds,
+        reflection_seconds=reflection_seconds,
+        quaternion_conversion_seconds=quaternion_conversion_seconds,
+        singular_value_seconds=singular_value_seconds,
+    )
+
+
+def prepare_gaussians_for_decomposition(
+    gaussians: Gaussians3D,
+    transform: torch.Tensor,
+) -> PreparedGaussians3D:
+    """Apply an affine transform and keep covariance matrices pre-SVD."""
+    transform_linear = transform[..., :3, :3]
+    transform_offset = transform[..., :3, 3]
+
+    mean_vectors = gaussians.mean_vectors @ transform_linear.T + transform_offset
+    covariance_matrices = compose_covariance_matrices(
+        gaussians.quaternions, gaussians.singular_values
+    )
+    covariance_matrices = (
+        transform_linear @ covariance_matrices @ transform_linear.transpose(-1, -2)
+    )
+    return PreparedGaussians3D(
+        mean_vectors=mean_vectors,
+        covariance_matrices=covariance_matrices,
+        colors=gaussians.colors,
+        opacities=gaussians.opacities,
+    )
+
+
+def move_prepared_gaussians_to_cpu(
+    prepared_gaussians: PreparedGaussians3D,
+    output_dtype: torch.dtype = torch.float32,
+) -> PreparedGaussians3D:
+    """Move prepared Gaussians to CPU while preserving exact decomposition inputs."""
+    return PreparedGaussians3D(
+        mean_vectors=prepared_gaussians.mean_vectors.detach().to(device="cpu", dtype=output_dtype),
+        covariance_matrices=prepared_gaussians.covariance_matrices.detach().to(
+            device="cpu",
+            dtype=torch.float64,
+        ),
+        colors=prepared_gaussians.colors.detach().to(device="cpu", dtype=output_dtype),
+        opacities=prepared_gaussians.opacities.detach().to(device="cpu", dtype=output_dtype),
+    )
+
+
+def finalize_prepared_gaussians(
+    prepared_gaussians: PreparedGaussians3D,
+    output_device: torch.device | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> Gaussians3D:
+    """Finalize prepared Gaussians by running exact covariance decomposition."""
+    return finalize_prepared_gaussians_profiled(
+        prepared_gaussians,
+        output_device=output_device,
+        output_dtype=output_dtype,
+    ).gaussians
+
+
+def finalize_prepared_gaussians_profiled(
+    prepared_gaussians: PreparedGaussians3D,
+    output_device: torch.device | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> FinalizedGaussiansResult:
+    """Finalize prepared Gaussians and capture exact CPU timing."""
+    if output_device is None:
+        output_device = prepared_gaussians.mean_vectors.device
+    if output_dtype is None:
+        output_dtype = prepared_gaussians.mean_vectors.dtype
+
+    decomposition = decompose_covariance_matrices_profiled(
+        prepared_gaussians.covariance_matrices,
+        output_dtype=output_dtype,
+        output_device=output_device,
+    )
+
+    assembly_start = time.perf_counter()
+
+    if (
+        prepared_gaussians.mean_vectors.device == output_device
+        and prepared_gaussians.mean_vectors.dtype == output_dtype
+    ):
+        mean_vectors = prepared_gaussians.mean_vectors
+    else:
+        mean_vectors = prepared_gaussians.mean_vectors.to(device=output_device, dtype=output_dtype)
+
+    if prepared_gaussians.colors.device == output_device and prepared_gaussians.colors.dtype == output_dtype:
+        colors = prepared_gaussians.colors
+    else:
+        colors = prepared_gaussians.colors.to(device=output_device, dtype=output_dtype)
+
+    if (
+        prepared_gaussians.opacities.device == output_device
+        and prepared_gaussians.opacities.dtype == output_dtype
+    ):
+        opacities = prepared_gaussians.opacities
+    else:
+        opacities = prepared_gaussians.opacities.to(device=output_device, dtype=output_dtype)
+
+    gaussians = Gaussians3D(
+        mean_vectors=mean_vectors,
+        singular_values=decomposition.singular_values,
+        quaternions=decomposition.quaternions,
+        colors=colors,
+        opacities=opacities,
+    )
+    cpu_assembly_seconds = time.perf_counter() - assembly_start
+    cpu_finalize_seconds = (
+        decomposition.reflection_seconds
+        + decomposition.quaternion_conversion_seconds
+        + decomposition.singular_value_seconds
+        + cpu_assembly_seconds
+    )
+    return FinalizedGaussiansResult(
+        gaussians=gaussians,
+        cpu_svd_seconds=decomposition.svd_seconds,
+        cpu_finalize_seconds=cpu_finalize_seconds,
+        cpu_reflection_seconds=decomposition.reflection_seconds,
+        cpu_quaternion_conversion_seconds=decomposition.quaternion_conversion_seconds,
+        cpu_singular_value_seconds=decomposition.singular_value_seconds,
+        cpu_assembly_seconds=cpu_assembly_seconds,
+    )
 
 
 def compose_covariance_matrices(
@@ -344,13 +527,31 @@ def load_ply(path: Path) -> tuple[Gaussians3D, SceneMetaData]:
 
 
 @torch.no_grad()
-def save_ply(
-    gaussians: Gaussians3D, f_px: float, image_shape: tuple[int, int], path: Path
+def build_plydata(
+    gaussians: Gaussians3D,
+    f_px: float,
+    image_shape: tuple[int, int],
 ) -> PlyData:
-    """Save a predicted Gaussian3D to a ply file."""
+    """Build PlyData for a predicted Gaussian3D without writing it to disk."""
+    return build_plydata_profiled(gaussians, f_px, image_shape).plydata
+
+
+@torch.no_grad()
+def build_plydata_profiled(
+    gaussians: Gaussians3D,
+    f_px: float,
+    image_shape: tuple[int, int],
+) -> PlySaveResult:
+    """Build PlyData for a predicted Gaussian3D and capture pack timings."""
 
     def _inverse_sigmoid(tensor: torch.Tensor) -> torch.Tensor:
         return torch.log(tensor / (1.0 - tensor))
+
+    def _to_numpy(tensor: torch.Tensor) -> np.ndarray:
+        tensor = tensor.detach()
+        if tensor.device.type == "cpu":
+            return tensor.numpy()
+        return tensor.cpu().numpy()
 
     xyz = gaussians.mean_vectors.flatten(0, 1)
     scale_logits = torch.log(gaussians.singular_values).flatten(0, 1)
@@ -386,6 +587,9 @@ def save_ply(
         ),
         dim=1,
     )
+    tensor_export_start = time.perf_counter()
+    attributes_np = np.ascontiguousarray(_to_numpy(attributes), dtype=np.float32)
+    ply_tensor_export_seconds = time.perf_counter() - tensor_export_start
 
     dtype_full = [
         (attribute, "f4")
@@ -397,8 +601,14 @@ def save_ply(
     ]
 
     num_gaussians = len(xyz)
+    vertex_fill_start = time.perf_counter()
     elements = np.empty(num_gaussians, dtype=dtype_full)
-    elements[:] = list(map(tuple, attributes.detach().cpu().numpy()))
+    field_names = [field for field, _ in dtype_full]
+    for index, field_name in enumerate(field_names):
+        elements[field_name] = attributes_np[:, index]
+    ply_vertex_fill_seconds = time.perf_counter() - vertex_fill_start
+
+    metadata_pack_start = time.perf_counter()
     vertex_elements = PlyElement.describe(elements, "vertex")
 
     # Load image-wise metadata.
@@ -478,6 +688,46 @@ def save_ply(
             version_element,
         ]
     )
+    ply_metadata_pack_seconds = time.perf_counter() - metadata_pack_start
+    ply_pack_seconds = (
+        ply_tensor_export_seconds + ply_vertex_fill_seconds + ply_metadata_pack_seconds
+    )
+    return PlySaveResult(
+        plydata=plydata,
+        ply_tensor_export_seconds=ply_tensor_export_seconds,
+        ply_vertex_fill_seconds=ply_vertex_fill_seconds,
+        ply_metadata_pack_seconds=ply_metadata_pack_seconds,
+        ply_pack_seconds=ply_pack_seconds,
+        ply_write_seconds=0.0,
+    )
 
-    plydata.write(path)
-    return plydata
+
+@torch.no_grad()
+def save_ply_profiled(
+    gaussians: Gaussians3D,
+    f_px: float,
+    image_shape: tuple[int, int],
+    path: Path,
+) -> PlySaveResult:
+    """Save a predicted Gaussian3D to a ply file with timing breakdown."""
+    build_result = build_plydata_profiled(gaussians, f_px, image_shape)
+
+    write_start = time.perf_counter()
+    build_result.plydata.write(path)
+    ply_write_seconds = time.perf_counter() - write_start
+    return PlySaveResult(
+        plydata=build_result.plydata,
+        ply_tensor_export_seconds=build_result.ply_tensor_export_seconds,
+        ply_vertex_fill_seconds=build_result.ply_vertex_fill_seconds,
+        ply_metadata_pack_seconds=build_result.ply_metadata_pack_seconds,
+        ply_pack_seconds=build_result.ply_pack_seconds,
+        ply_write_seconds=ply_write_seconds,
+    )
+
+
+@torch.no_grad()
+def save_ply(
+    gaussians: Gaussians3D, f_px: float, image_shape: tuple[int, int], path: Path
+) -> PlyData:
+    """Save a predicted Gaussian3D to a ply file."""
+    return save_ply_profiled(gaussians, f_px, image_shape, path).plydata
