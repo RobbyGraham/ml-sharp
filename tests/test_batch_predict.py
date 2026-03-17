@@ -17,17 +17,25 @@ import torch.nn.functional as F
 from Batch.batch_predict import (
     HARDWARE_SAMPLES_FILENAME,
     SUMMARY_FILENAME,
+    TUNED_CUDA_DECODE_WORKERS,
+    TUNED_CUDA_SAVE_WORKERS,
+    TUNED_CUDA_SVD_WORKERS,
+    TUNED_CUDA_TORCH_NUM_INTEROP_THREADS,
+    TUNED_CUDA_TORCH_NUM_THREADS,
     build_image_jobs,
     compute_throughput_after_warmup,
     default_decode_workers,
     default_postprocess_workers,
     default_save_workers,
     default_svd_workers,
+    default_torch_num_interop_threads,
+    default_torch_num_threads,
     default_write_workers,
     derive_cpu_stage_workers,
     discover_image_paths,
     parse_args,
     resolve_cpu_stage_workers,
+    should_use_tuned_cuda_defaults,
     summarize_hardware_samples,
     write_hardware_samples,
     write_summary,
@@ -121,6 +129,12 @@ class BatchPredictTests(unittest.TestCase):
         self.assertGreaterEqual(default_svd_workers(), 1)
         self.assertGreaterEqual(default_save_workers(), 1)
         self.assertEqual(default_save_workers(), default_write_workers())
+        default_threads = default_torch_num_threads()
+        if default_threads is not None:
+            self.assertGreaterEqual(default_threads, 1)
+        default_interop_threads = default_torch_num_interop_threads()
+        if default_interop_threads is not None:
+            self.assertGreaterEqual(default_interop_threads, 1)
 
     def test_derive_cpu_stage_workers_prefers_svd_capacity(self) -> None:
         self.assertEqual(derive_cpu_stage_workers(8), (5, 3))
@@ -193,6 +207,83 @@ class BatchPredictTests(unittest.TestCase):
         self.assertTrue(args.hardware_profile)
         self.assertTrue(args.profile)
         self.assertEqual(args.hardware_sample_interval, 0.25)
+
+    def test_thread_budget_flags_parse(self) -> None:
+        argv = [
+            "batch_predict.py",
+            "--input-dir",
+            "Input",
+            "--output-dir",
+            "Output",
+            "--checkpoint-path",
+            "sharp.pt",
+            "--focal-35mm-mm",
+            "35",
+            "--torch-num-threads",
+            "8",
+            "--torch-num-interop-threads",
+            "2",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = parse_args()
+
+        self.assertEqual(args.torch_num_threads, 8)
+        self.assertEqual(args.torch_num_interop_threads, 2)
+
+    def test_high_core_cuda_defaults_resolve_to_tuned_profile(self) -> None:
+        argv = [
+            "batch_predict.py",
+            "--input-dir",
+            "Input",
+            "--output-dir",
+            "Output",
+            "--checkpoint-path",
+            "sharp.pt",
+            "--focal-35mm-mm",
+            "35",
+            "--device",
+            "cuda",
+        ]
+        with (
+            patch("Batch.batch_predict.os.cpu_count", return_value=48),
+            patch("Batch.batch_predict.torch.cuda.is_available", return_value=True),
+            patch.object(sys, "argv", argv),
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.decode_workers, TUNED_CUDA_DECODE_WORKERS)
+        self.assertEqual(args.svd_workers, TUNED_CUDA_SVD_WORKERS)
+        self.assertEqual(args.save_workers, TUNED_CUDA_SAVE_WORKERS)
+        self.assertEqual(args.postprocess_workers, TUNED_CUDA_SVD_WORKERS + TUNED_CUDA_SAVE_WORKERS)
+        self.assertEqual(args.queue_depth, TUNED_CUDA_DECODE_WORKERS * 2)
+        self.assertEqual(args.torch_num_threads, TUNED_CUDA_TORCH_NUM_THREADS)
+        self.assertEqual(
+            args.torch_num_interop_threads,
+            TUNED_CUDA_TORCH_NUM_INTEROP_THREADS,
+        )
+
+    def test_should_use_tuned_cuda_defaults_requires_high_core_cuda(self) -> None:
+        self.assertTrue(
+            should_use_tuned_cuda_defaults(
+                "cuda",
+                cpu_count=48,
+                cuda_available=True,
+            )
+        )
+        self.assertFalse(
+            should_use_tuned_cuda_defaults(
+                "cpu",
+                cpu_count=48,
+                cuda_available=True,
+            )
+        )
+        self.assertFalse(
+            should_use_tuned_cuda_defaults(
+                "cuda",
+                cpu_count=16,
+                cuda_available=True,
+            )
+        )
 
     def test_compute_throughput_after_warmup(self) -> None:
         throughput = compute_throughput_after_warmup([10.0, 12.0, 14.0, 16.0])

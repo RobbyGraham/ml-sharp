@@ -48,6 +48,12 @@ HARDWARE_SAMPLES_FILENAME = "batch_hardware_samples.jsonl"
 LOG_FILENAME = "batch_predict.log"
 MAX_INLINE_HARDWARE_SAMPLES = 512
 LOW_GPU_UTILIZATION_THRESHOLD = 30.0
+HIGH_CORE_CPU_THRESHOLD = 32
+TUNED_CUDA_DECODE_WORKERS = 8
+TUNED_CUDA_SVD_WORKERS = 6
+TUNED_CUDA_SAVE_WORKERS = 2
+TUNED_CUDA_TORCH_NUM_THREADS = 6
+TUNED_CUDA_TORCH_NUM_INTEROP_THREADS = 1
 
 
 @dataclass(frozen=True)
@@ -425,19 +431,40 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Seconds between lightweight hardware utilization samples.",
     )
+    parser.add_argument(
+        "--torch-num-threads",
+        type=int,
+        default=None,
+        help="Torch intra-op CPU thread budget for exact CPU stages.",
+    )
+    parser.add_argument(
+        "--torch-num-interop-threads",
+        type=int,
+        default=None,
+        help="Torch inter-op CPU thread budget for exact CPU stages.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging.")
     args = parser.parse_args()
+
+    cpu_count = os.cpu_count() or 8
+    use_tuned_cuda_defaults = should_use_tuned_cuda_defaults(args.device, cpu_count=cpu_count)
 
     if args.focal_35mm_mm <= 0:
         parser.error("--focal-35mm-mm must be positive.")
 
     if args.decode_workers is None:
-        args.decode_workers = default_decode_workers()
+        args.decode_workers = default_decode_workers(
+            device_name=args.device,
+            cpu_count=cpu_count,
+        )
     elif args.decode_workers <= 0:
         parser.error("--decode-workers must be positive.")
 
     if args.postprocess_workers is None:
-        args.postprocess_workers = default_postprocess_workers()
+        args.postprocess_workers = default_postprocess_workers(
+            device_name=args.device,
+            cpu_count=cpu_count,
+        )
     elif args.postprocess_workers <= 0:
         parser.error("--postprocess-workers must be positive.")
 
@@ -455,8 +482,33 @@ def parse_args() -> argparse.Namespace:
     if args.hardware_sample_interval <= 0:
         parser.error("--hardware-sample-interval must be positive.")
 
+    if args.torch_num_threads is None:
+        args.torch_num_threads = default_torch_num_threads(
+            device_name=args.device,
+            cpu_count=cpu_count,
+        )
+    elif args.torch_num_threads <= 0:
+        parser.error("--torch-num-threads must be positive.")
+
+    if args.torch_num_interop_threads is None:
+        args.torch_num_interop_threads = default_torch_num_interop_threads(
+            device_name=args.device,
+            cpu_count=cpu_count,
+        )
+    elif args.torch_num_interop_threads <= 0:
+        parser.error("--torch-num-interop-threads must be positive.")
+
     if args.hardware_profile:
         args.profile = True
+
+    if (
+        use_tuned_cuda_defaults
+        and args.postprocess_workers == TUNED_CUDA_SVD_WORKERS + TUNED_CUDA_SAVE_WORKERS
+        and args.svd_workers is None
+        and args.save_workers is None
+    ):
+        args.svd_workers = TUNED_CUDA_SVD_WORKERS
+        args.save_workers = TUNED_CUDA_SAVE_WORKERS
 
     args.svd_workers, args.save_workers = resolve_cpu_stage_workers(
         args.postprocess_workers,
@@ -468,15 +520,47 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def default_decode_workers() -> int:
+def should_use_tuned_cuda_defaults(
+    device_name: str,
+    *,
+    cpu_count: int | None = None,
+    cuda_available: bool | None = None,
+) -> bool:
+    """Return whether the workstation-style CUDA tuning profile should be used."""
+    if cpu_count is None:
+        cpu_count = os.cpu_count() or 8
+    if cpu_count < HIGH_CORE_CPU_THRESHOLD:
+        return False
+    if device_name == "cuda":
+        return True
+    if device_name == "default":
+        if cuda_available is None:
+            cuda_available = torch.cuda.is_available()
+        return cuda_available
+    return False
+
+
+def default_decode_workers(
+    device_name: str = "default",
+    *,
+    cpu_count: int | None = None,
+) -> int:
     """Return the default number of decode workers."""
-    cpu_count = os.cpu_count() or 8
+    if cpu_count is None:
+        cpu_count = os.cpu_count() or 8
+    if should_use_tuned_cuda_defaults(device_name, cpu_count=cpu_count):
+        return TUNED_CUDA_DECODE_WORKERS
     return min(16, max(4, cpu_count // 2))
 
 
-def default_postprocess_workers() -> int:
+def default_postprocess_workers(
+    device_name: str = "default",
+    *,
+    cpu_count: int | None = None,
+) -> int:
     """Return the default number of exact CPU postprocess workers."""
-    cpu_count = os.cpu_count() or 8
+    if cpu_count is None:
+        cpu_count = os.cpu_count() or 8
     return min(8, max(2, cpu_count // 4))
 
 
@@ -507,19 +591,93 @@ def resolve_cpu_stage_workers(
     return svd_workers, save_workers
 
 
-def default_svd_workers() -> int:
+def default_svd_workers(
+    device_name: str = "default",
+    *,
+    cpu_count: int | None = None,
+) -> int:
     """Return the default number of SVD/finalize workers."""
-    return derive_cpu_stage_workers(default_postprocess_workers())[0]
+    if cpu_count is None:
+        cpu_count = os.cpu_count() or 8
+    if should_use_tuned_cuda_defaults(device_name, cpu_count=cpu_count):
+        return TUNED_CUDA_SVD_WORKERS
+    return derive_cpu_stage_workers(
+        default_postprocess_workers(device_name=device_name, cpu_count=cpu_count)
+    )[0]
 
 
-def default_save_workers() -> int:
+def default_save_workers(
+    device_name: str = "default",
+    *,
+    cpu_count: int | None = None,
+) -> int:
     """Return the default number of save workers."""
-    return derive_cpu_stage_workers(default_postprocess_workers())[1]
+    if cpu_count is None:
+        cpu_count = os.cpu_count() or 8
+    if should_use_tuned_cuda_defaults(device_name, cpu_count=cpu_count):
+        return TUNED_CUDA_SAVE_WORKERS
+    return derive_cpu_stage_workers(
+        default_postprocess_workers(device_name=device_name, cpu_count=cpu_count)
+    )[1]
 
 
-def default_write_workers() -> int:
+def default_write_workers(
+    device_name: str = "default",
+    *,
+    cpu_count: int | None = None,
+) -> int:
     """Backward-compatible alias for the legacy worker name."""
-    return default_save_workers()
+    return default_save_workers(device_name=device_name, cpu_count=cpu_count)
+
+
+def default_torch_num_threads(
+    device_name: str = "default",
+    *,
+    cpu_count: int | None = None,
+) -> int | None:
+    """Return the default torch intra-op thread budget."""
+    if cpu_count is None:
+        cpu_count = os.cpu_count() or 8
+    if should_use_tuned_cuda_defaults(device_name, cpu_count=cpu_count):
+        return TUNED_CUDA_TORCH_NUM_THREADS
+    return None
+
+
+def default_torch_num_interop_threads(
+    device_name: str = "default",
+    *,
+    cpu_count: int | None = None,
+) -> int | None:
+    """Return the default torch inter-op thread budget."""
+    if cpu_count is None:
+        cpu_count = os.cpu_count() or 8
+    if should_use_tuned_cuda_defaults(device_name, cpu_count=cpu_count):
+        return TUNED_CUDA_TORCH_NUM_INTEROP_THREADS
+    return None
+
+
+def apply_torch_thread_settings(args: argparse.Namespace) -> tuple[int, int]:
+    """Apply torch CPU thread settings before model load and return resolved values."""
+    requested_num_threads = args.torch_num_threads
+    requested_num_interop_threads = args.torch_num_interop_threads
+
+    if requested_num_threads is not None:
+        torch.set_num_threads(requested_num_threads)
+
+    if requested_num_interop_threads is not None:
+        current_interop_threads = torch.get_num_interop_threads()
+        if current_interop_threads != requested_num_interop_threads:
+            try:
+                torch.set_num_interop_threads(requested_num_interop_threads)
+            except RuntimeError as exc:  # pragma: no cover - defensive only
+                LOGGER.warning(
+                    "Unable to change torch inter-op threads to %d: %s. Continuing with %d.",
+                    requested_num_interop_threads,
+                    exc,
+                    current_interop_threads,
+                )
+
+    return torch.get_num_threads(), torch.get_num_interop_threads()
 
 
 def discover_image_paths(input_dir: Path) -> list[Path]:
@@ -1239,6 +1397,8 @@ def run_batch(args: argparse.Namespace) -> dict[str, Any]:
         "postprocess_workers": args.postprocess_workers,
         "write_workers": args.save_workers,
         "queue_depth": args.queue_depth,
+        "torch_num_threads": torch.get_num_threads(),
+        "torch_num_interop_threads": torch.get_num_interop_threads(),
         "profile_enabled": args.profile,
         "hardware_profile_enabled": args.hardware_profile,
         "hardware_sample_interval_seconds": (
@@ -1256,6 +1416,8 @@ def run_batch(args: argparse.Namespace) -> dict[str, Any]:
         "throughput_after_warmup_images_per_second": throughput_after_warmup,
         "profiling": {
             "enabled": args.profile,
+            "torch_num_threads": torch.get_num_threads(),
+            "torch_num_interop_threads": torch.get_num_interop_threads(),
             "queue_stats": queue_stats,
         },
     }
@@ -1279,6 +1441,12 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     log_path = args.output_dir / LOG_FILENAME
     logging_utils.configure(logging.DEBUG if args.verbose else logging.INFO, log_path=log_path)
+    torch_num_threads, torch_num_interop_threads = apply_torch_thread_settings(args)
+    LOGGER.info(
+        "Torch CPU threads=%d, inter-op threads=%d",
+        torch_num_threads,
+        torch_num_interop_threads,
+    )
 
     try:
         summary = run_batch(args)
